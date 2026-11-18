@@ -25,6 +25,7 @@ from app.services.anomaly_log import AnomalyLogService
 from app.services.scheduler import SchedulerService
 from app.services.report_dashboard import ReportDashboardService
 from app.services.task_queue import TaskQueueService
+from app.services.credential_binding import CredentialBindingService, env_binding
 from app.services.runtime_session import RuntimeSessionService, runtime_session
 from app.services.callback_hook import CallbackHookService, callback_hook
 from app.services.pipeline import (  # noqa: F401

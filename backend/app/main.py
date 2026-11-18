@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,6 +14,8 @@ from app.config import settings
 from app.routers import ROUTERS
 from app.store import store
 from app.services import runtime_session, callback_hook
+from app.services.credential_binding import env_binding
+from app.services.credential_store import CredentialStoreService
 
 app = FastAPI(title="RPA流程自动化中心", version="1.0.0")
 
@@ -59,6 +63,7 @@ def nodestats(module: str | None = Query(default=None)) -> dict[str, object]:
     # 附加非模块服务
     snapshots["runtime_session"] = runtime_session.domain_snapshot()
     snapshots["callback_hook"] = callback_hook.domain_snapshot()
+    snapshots["credential_binding"] = env_binding.domain_snapshot()
 
     # 存储基础设施概览
     infra = {
@@ -134,6 +139,86 @@ def runtime_sessions() -> dict[str, object]:
     """运行时会话列表。"""
     sessions = runtime_session.list_sessions()
     return {"count": len(sessions), "sessions": sessions}
+
+
+# ---- 凭据有效期 · 环境绑定 · 运行会话 ----
+
+@app.get("/api/credential-workbench")
+def credential_workbench() -> dict[str, object]:
+    """凭据工作台：有效期、当前绑定、切换记录、可执行绑定清单与恢复入口。"""
+    return CredentialStoreService().workbench()
+
+
+@app.get("/api/credential-manifest")
+def credential_manifest(
+    target_system: str | None = Query(default=None),
+    handling_item: str | None = Query(default=None),
+) -> dict[str, object]:
+    """可执行环境绑定清单：解析每个目标系统的下一次安全切换点。"""
+    return env_binding.resolve_manifest(
+        target_system=target_system, handling_item=handling_item)
+
+
+@app.get("/api/credential-bindings")
+def credential_bindings(system: str | None = Query(default=None)) -> dict[str, object]:
+    """凭据环境绑定清单（含已切换/已失效的历史绑定）。"""
+    bindings = env_binding.list_bindings(system)
+    return {"count": len(bindings), "bindings": bindings}
+
+
+@app.get("/api/credential-switches")
+def credential_switches(credential_id: int | None = Query(default=None)) -> dict[str, object]:
+    """切换记录：为什么切、从哪条凭据切到哪条。"""
+    records = env_binding.switch_records(credential_id)
+    return {"count": len(records), "records": records}
+
+
+@app.post("/api/credential-sessions")
+def start_credential_session(payload: dict[str, Any] | None = None) -> dict[str, object]:
+    """按处理项龙边界启动运行会话（并发重复提交只计一次）。"""
+    body = payload or {}
+    handling_item = str(body.get("handling_item") or "").strip()
+    if not handling_item:
+        return {"ok": False, "message": "缺少处理项龙编号 handling_item"}
+    return runtime_session.start_credential_session(
+        handling_item,
+        boundary=str(body.get("boundary") or "switch_failover"),
+    )
+
+
+@app.get("/api/credential-sessions")
+def list_credential_sessions(handling_item: str | None = Query(default=None)) -> dict[str, object]:
+    """按处理项龙查询运行会话。"""
+    sessions = env_binding.list_sessions(handling_item)
+    return {"count": len(sessions), "sessions": sessions}
+
+
+@app.post("/api/credential-sessions/{session_id}/expiry")
+def credential_session_expiry(
+    session_id: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """批次执行中凭据过期：切换备用凭据继续，或暂停等待轮换；冲突落到27号处理终态。"""
+    body = payload or {}
+    boundary = str(body.get("boundary") or "switch_failover")
+    if boundary not in ("switch_failover", "pause_and_wait"):
+        return {"ok": False, "message": f"未知处理边界: {boundary}"}
+    try:
+        return runtime_session.handle_credential_expiry(session_id, boundary)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+
+
+@app.post("/api/credential-sessions/{session_id}/resume")
+def resume_credential_session(session_id: str) -> dict[str, object]:
+    """恢复会话：重新核对绑定清单，不回退到已过期或已吊销凭据。"""
+    return runtime_session.resume_credential_session(session_id)
+
+
+@app.post("/api/credential-sessions/{session_id}/archive")
+def archive_credential_session(session_id: str) -> dict[str, object]:
+    """归档会话（归档后可恢复，恢复时仍按当前有效期重新核对）。"""
+    return env_binding.archive_session(session_id)
 
 
 # ---- 跨模块数据流编排入口 ----

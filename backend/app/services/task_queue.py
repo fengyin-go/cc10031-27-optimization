@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.credential_binding import env_binding
 from app.store import store
 
 
@@ -136,9 +137,11 @@ class TaskQueueService(BaseModuleService):
         """从排队中取下一批任务标记为执行中。
 
         模拟调度器的取任务逻辑 — 按优先级 + 提交时间排序。
+        调度前先核对可执行环境绑定清单：没有合法绑定的任务不进入执行，
+        避免起跑后才发现凭据已过期或已吊销。
 
         Returns:
-            {"scheduled": int, "task_ids": [...]}
+            {"scheduled": int, "task_ids": [...], "blocked": [...]}
         """
         rows = store.rows(self.MODULE)
         queued = [
@@ -149,12 +152,37 @@ class TaskQueueService(BaseModuleService):
         priority_order = {"高": 0, "中": 1, "低": 2}
         queued.sort(key=lambda r: priority_order.get(r.get("优先级", "低"), 99))
 
+        manifest = env_binding.resolve_manifest()
+        executable_systems = {
+            item["target_system"]: item
+            for item in manifest["items"] if item["executable"]
+        }
+
         scheduled = []
-        for task in queued[:max_tasks]:
+        blocked: list[dict[str, Any]] = []
+        for task in queued:
+            if len(scheduled) >= max_tasks:
+                break
+            item = self._match_manifest_item(task, executable_systems)
+            if item is None:
+                blocked.append({
+                    "task_id": task["id"],
+                    "task_number": task.get("任务编号"),
+                    "reason": "无可执行环境绑定（凭据可能已过期或已吊销）",
+                })
+                store.recovery.log(
+                    module=self.MODULE,
+                    batch_ref=str(task.get("任务编号") or task.get("id")),
+                    step="调度前核对凭据绑定",
+                    error_detail="无可执行环境绑定，任务保持在排队中",
+                )
+                continue
             task["status"] = "执行中"
             task["pending"] = True
             task["开始执行时间"] = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%d %H:%M:%S")
+            task["绑定凭据"] = item["credential_name"]
+            task["下次切换时间"] = item["next_switch_at"]
             scheduled.append(task["id"])
             # 模拟执行记录
             store.channel.publish(
@@ -164,10 +192,41 @@ class TaskQueueService(BaseModuleService):
                     "task_id": task["id"],
                     "task_number": task.get("任务编号"),
                     "start_time": task["开始执行时间"],
+                    "target_system": item["target_system"],
+                    "credential_id": item["credential_id"],
+                    "binding_id": item["binding_id"],
+                    "next_switch_at": item["next_switch_at"],
+                    "switch_reason": item["switch_reason"],
                 },
             )
 
-        return {"scheduled": len(scheduled), "task_ids": scheduled}
+        return {"scheduled": len(scheduled), "task_ids": scheduled, "blocked": blocked}
+
+    @staticmethod
+    def _match_manifest_item(
+        task: dict[str, Any],
+        executable_systems: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """把任务挂到可执行绑定上：按流程定义的目标系统匹配，找不到就不放行。"""
+        haystack = f"{task.get('流程名称', '')} {task.get('任务编号', '')}"
+        bot_id = task.get("bot_id")
+        if bot_id is not None:
+            bot = store.find("bot_definition", int(bot_id))
+            if bot is not None:
+                haystack = f"{haystack} {bot.get('目标系统', '')}"
+        for system, item in executable_systems.items():
+            if not system:
+                continue
+            if system in haystack:
+                return item
+            # 「ERP系统」与流程名里的「ERP」视为同一目标系统
+            shortened = system
+            for suffix in ("系统", "平台", "服务", "应用"):
+                if shortened.endswith(suffix):
+                    shortened = shortened[: -len(suffix)]
+            if shortened and shortened in haystack:
+                return item
+        return None
 
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()

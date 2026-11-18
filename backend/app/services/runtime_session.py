@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app.services.credential_binding import env_binding
 from app.store import store
 
 
@@ -162,7 +163,79 @@ class RuntimeSessionService:
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         return self._sessions.get(session_id)
 
+    # ---- 凭据环境绑定：按处理项龙边界核对可执行清单 --------------------
+
+    def start_credential_session(
+        self,
+        handling_item: str,
+        boundary: str = "switch_failover",
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """在校验可执行环境绑定清单后启动运行会话。
+
+        会话只持有清单里 executable=True 的绑定；清单为空时进入等待轮换，
+        不会退化成「找一条凭据先跑」。
+        """
+        manifest = env_binding.resolve_manifest(handling_item=handling_item, now=now)
+        result = env_binding.start_session(
+            handling_item, boundary=boundary, manifest=manifest, now=now)
+        session = result["session"]
+        self._sessions[session["session_id"]] = {
+            "session_id": session["session_id"],
+            "started_at": session["created_at"],
+            "credential_session": True,
+            "handling_item": handling_item,
+            "boundary": boundary,
+            "status": session["status"],
+            "strategies_applied": 0,
+            "actions_executed": 0,
+            "errors": 0,
+            "manifest_digest": manifest.get("manifest_digest"),
+            "credential_ids": [
+                item["credential_id"] for item in manifest.get("items", [])
+                if item.get("executable")
+            ],
+        }
+        return {**result, "manifest": manifest}
+
+    def handle_credential_expiry(
+        self,
+        session_id: str,
+        boundary: str = "switch_failover",
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """同一采集批次执行中凭据过期：按边界切换或暂停，都不使用过期凭据。"""
+        result = env_binding.handle_mid_batch_expiry(session_id, boundary, now=now)
+        local = self._sessions.get(session_id)
+        if local is not None:
+            local["status"] = result["session"]["status"]
+            local["credential_ids"] = [
+                assignment["credential_id"]
+                for assignment in result["session"]["assignments"].values()
+            ]
+        return result
+
+    def resume_credential_session(
+        self,
+        session_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """恢复会话：重新核对清单，绝不回退到已过期或已吊销凭据。"""
+        result = env_binding.resume_session(session_id, now=now)
+        local = self._sessions.get(session_id)
+        if local is not None and result.get("session"):
+            local["status"] = result["session"]["status"]
+            local["credential_ids"] = [
+                assignment["credential_id"]
+                for assignment in result["session"]["assignments"].values()
+            ]
+        return result
+
     def domain_snapshot(self) -> dict[str, Any]:
+        credential_snapshot = env_binding.domain_snapshot()
         return {
             "module": self.SERVICE_NAME,
             "entity": "运行时会话",
@@ -172,6 +245,11 @@ class RuntimeSessionService:
                 s.get("actions_executed", 0) for s in self._sessions.values()),
             "automation_events": len(
                 store.channel.snapshot(topic="rpa.automation_executed")),
+            "credential_sessions": sum(
+                1 for s in self._sessions.values() if s.get("credential_session")),
+            "credential_bindings": credential_snapshot["count"],
+            "credential_sessions_pending": credential_snapshot["sessions"],
+            "terminal_state": credential_snapshot["terminal_state"],
         }
 
 

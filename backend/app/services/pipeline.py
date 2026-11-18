@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.credential_binding import env_binding
 from app.store import store
 
 
@@ -418,9 +419,16 @@ def pipeline_enrich_verify(enrich_id: int | None = None) -> PipelineResult:
 # ---------------------------------------------------------------------------
 
 def pipeline_credential_env(cred_id: int | None = None) -> PipelineResult:
-    """凭据管理 → 环境配置 绑定执行环境链路。"""
+    """凭据管理 → 环境配置 绑定执行环境链路。
+
+    除原有「凭据可用 + 环境可用」判断外，额外解析可执行环境绑定清单：
+    绑定必须指向未过期、未吊销的凭据，并给出下一次安全切换点。
+    """
     result = PipelineResult(pipeline="credential_store→env_profile", ok=True)
     vault = DirtyDataVault()
+
+    # 0) 先按有效期推进状态，避免把过期凭据当成正常
+    env_binding.sync_credential_statuses()
 
     # 1) 凭据管理
     creds = store.rows("credential_store")
@@ -447,7 +455,24 @@ def pipeline_credential_env(cred_id: int | None = None) -> PipelineResult:
         if env.get("status") not in ("可用",):
             vault.isolate(env, f"环境不可用: {env.get('status')}", "env_profile")
     result.data["env_available"] = sum(1 for e in envs if e.get("status") == "可用")
-    result.data["bound"] = result.data["cred_normal"] > 0 and result.data["env_available"] > 0
+
+    # 3) 可执行环境绑定清单：每个目标系统一条，绑定凭据必须仍可用
+    manifest = env_binding.resolve_manifest()
+    result.data["manifest_digest"] = manifest["manifest_digest"]
+    result.data["executable_systems"] = [
+        item["target_system"] for item in manifest["items"] if item["executable"]
+    ]
+    result.data["blocked_systems"] = manifest["blocked"]
+    result.data["next_switch_points"] = {
+        item["target_system"]: item["next_switch_at"]
+        for item in manifest["items"] if item["executable"]
+    }
+    for item in manifest["items"]:
+        if not item["executable"]:
+            result.add_error(f"{item['target_system']} 无可执行绑定: {item['blocked_reason']}")
+
+    result.data["bound"] = bool(result.data["executable_systems"]) and result.data["env_available"] > 0
+    result.wait_required = bool(manifest["blocked"])
 
     result.dirty = vault.list_all()
     return result

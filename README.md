@@ -71,6 +71,31 @@ npm run dev
 | 运行概览 | `report_dashboard` | 运行数据 | 统计日期、总执行数、成功数 |
 | 任务队列 | `task_queue` | 排队任务 | 任务编号、流程名称、提交时间 |
 
+## 凭据有效期与执行环境绑定
+
+凭据状态不再只由单条动作决定，而是由「有效期」与「轮换周期」共同推进：
+
+- `正常` → 距有效期不足半个轮换周期（最多 14 天）→ `即将过期`；超过有效期 → `已过期`；
+- `吊销凭据` 是终态，不会被日期或轮换改回 `正常`；
+- `轮换凭据` 会延长有效期、把状态推进回 `正常`，并同步推进环境绑定。
+
+跨模块核心在 `backend/app/services/credential_binding.py`：
+
+| 能力 | 说明 |
+| --- | --- |
+| `resolve_manifest` | 解析每个目标系统的下一次安全切换点，生成可执行环境绑定清单 |
+| `start_session` | 按处理项龙边界启动运行会话，并发重复提交只计一次 |
+| `handle_mid_batch_expiry` | 批次执行中凭据过期：切换备用凭据 / 暂停等待轮换，均不使用过期凭据 |
+| 边界冲突 | 两套边界同时命中时，绑定落到 `27号处理终态` |
+| `resume_session` | 恢复时重新核对清单，绝不回退到已过期或已吊销凭据 |
+
+前端在「凭据管理」页签下方提供凭据工作台（`src/components/CredentialBindingPanel.vue`），
+可查看有效期、当前绑定、可执行绑定清单、运行会话与切换记录。
+
+相关接口：`GET /api/credential-workbench`、`GET /api/credential-manifest`、
+`POST /api/credential-sessions`、`POST /api/credential-sessions/{id}/expiry|resume|archive`。
+`GET /api/credential_store` 的列表行也会附带剩余天数、当前绑定凭据与下次切换时间。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
